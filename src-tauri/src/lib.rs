@@ -77,19 +77,7 @@ const OPENCODE_EXECUTABLE: &str = "opencode.exe";
 const OPENCODE_EXECUTABLE: &str = "opencode";
 
 fn home_dir() -> Option<PathBuf> {
-  if let Ok(home) = env::var("HOME") {
-    if !home.trim().is_empty() {
-      return Some(PathBuf::from(home));
-    }
-  }
-
-  if let Ok(profile) = env::var("USERPROFILE") {
-    if !profile.trim().is_empty() {
-      return Some(PathBuf::from(profile));
-    }
-  }
-
-  None
+  dirs::home_dir()
 }
 
 fn path_entries() -> Vec<PathBuf> {
@@ -116,16 +104,28 @@ fn candidate_opencode_paths() -> Vec<PathBuf> {
   let mut candidates = Vec::new();
 
   if let Some(home) = home_dir() {
+    #[cfg(not(windows))]
+    candidates.push(home.join(".opencode").join("bin").join(OPENCODE_EXECUTABLE));
+
+    #[cfg(windows)]
     candidates.push(home.join(".opencode").join("bin").join(OPENCODE_EXECUTABLE));
   }
 
-  // Homebrew default paths.
-  candidates.push(PathBuf::from("/opt/homebrew/bin").join(OPENCODE_EXECUTABLE));
-  candidates.push(PathBuf::from("/usr/local/bin").join(OPENCODE_EXECUTABLE));
+  #[cfg(windows)]
+  {
+    if let Some(home) = home_dir() {
+        candidates.push(home.join("scoop").join("shims").join(OPENCODE_EXECUTABLE));
+    }
+    candidates.push(PathBuf::from("C:\\ProgramData\\chocolatey\\bin").join(OPENCODE_EXECUTABLE));
+  }
 
-  // Common Linux paths.
-  candidates.push(PathBuf::from("/usr/bin").join(OPENCODE_EXECUTABLE));
-  candidates.push(PathBuf::from("/usr/local/bin").join(OPENCODE_EXECUTABLE));
+  // Homebrew default paths.
+  #[cfg(not(windows))]
+  {
+    candidates.push(PathBuf::from("/opt/homebrew/bin").join(OPENCODE_EXECUTABLE));
+    candidates.push(PathBuf::from("/usr/local/bin").join(OPENCODE_EXECUTABLE));
+    candidates.push(PathBuf::from("/usr/bin").join(OPENCODE_EXECUTABLE));
+  }
 
   candidates
 }
@@ -237,15 +237,29 @@ fn resolve_opencode_config_path(scope: &str, project_dir: &str) -> Result<PathBu
       Ok(PathBuf::from(project_dir).join("opencode.json"))
     }
     "global" => {
-      let base = if let Ok(dir) = env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(dir)
-      } else if let Ok(home) = env::var("HOME") {
-        PathBuf::from(home).join(".config")
-      } else {
-        return Err("Unable to resolve config directory".to_string());
-      };
+      #[cfg(windows)]
+      {
+        if let Some(config_dir) = dirs::config_dir() {
+             return Ok(config_dir.join("opencode").join("opencode.json"));
+        }
+        // Fallback to home dir if config dir fails
+        if let Some(home) = dirs::home_dir() {
+            return Ok(home.join(".config").join("opencode").join("opencode.json"));
+        }
+        Err("Unable to resolve config directory".to_string())
+      }
 
-      Ok(base.join("opencode").join("opencode.json"))
+      #[cfg(not(windows))]
+      {
+          let base = if let Ok(dir) = env::var("XDG_CONFIG_HOME") {
+            PathBuf::from(dir)
+          } else if let Ok(home) = env::var("HOME") {
+            PathBuf::from(home).join(".config")
+          } else {
+            return Err("Unable to resolve config directory".to_string());
+          };
+          Ok(base.join("opencode").join("opencode.json"))
+      }
     }
     _ => Err("scope must be 'project' or 'global'".to_string()),
   }
@@ -327,12 +341,22 @@ fn engine_doctor() -> EngineDoctorResult {
 fn engine_install() -> Result<ExecResult, String> {
   #[cfg(windows)]
   {
-    return Ok(ExecResult {
-      ok: false,
-      status: -1,
-      stdout: String::new(),
-      stderr: "Guided install is not supported on Windows yet. Install OpenCode via Scoop/Chocolatey or https://opencode.ai/install, then restart OpenWork.".to_string(),
-    });
+    let output = Command::new("powershell")
+      .arg("-NoProfile")
+      .arg("-ExecutionPolicy")
+      .arg("Bypass")
+      .arg("-Command")
+      .arg("iwr https://opencode.ai/install.ps1 -useb | iex")
+      .output()
+      .map_err(|e| format!("Failed to run installer: {e}"))?;
+
+    let status = output.status.code().unwrap_or(-1);
+    Ok(ExecResult {
+      ok: output.status.success(),
+      status,
+      stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+      stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
   }
 
   #[cfg(not(windows))]
@@ -377,8 +401,15 @@ fn engine_start(manager: State<EngineManager>, project_dir: String) -> Result<En
   let (program, _in_path, notes) = resolve_opencode_executable();
   let Some(program) = program else {
     let notes_text = notes.join("\n");
+    #[cfg(windows)]
+    let install_msg = "OpenCode CLI not found.\n\nInstall via PowerShell:\niwr https://opencode.ai/install.ps1 -useb | iex";
+    #[cfg(not(windows))]
+    let install_msg = "OpenCode CLI not found.\n\nInstall with:\n- brew install anomalyco/tap/opencode\n- curl -fsSL https://opencode.ai/install | bash";
+
     return Err(format!(
-      "OpenCode CLI not found.\n\nInstall with:\n- brew install anomalyco/tap/opencode\n- curl -fsSL https://opencode.ai/install | bash\n\nNotes:\n{notes_text}"
+      "{}\n\nNotes:\n{}",
+      install_msg,
+      notes_text
     ));
   };
 
@@ -414,6 +445,19 @@ fn engine_start(manager: State<EngineManager>, project_dir: String) -> Result<En
   Ok(EngineManager::snapshot_locked(&mut state))
 }
 
+fn cross_platform_command(program: &str) -> Command {
+  #[cfg(windows)]
+  {
+    let mut cmd = Command::new("cmd");
+    cmd.arg("/C").arg(program);
+    cmd
+  }
+  #[cfg(not(windows))]
+  {
+    Command::new(program)
+  }
+}
+
 #[tauri::command]
 fn opkg_install(project_dir: String, package: String) -> Result<ExecResult, String> {
   let project_dir = project_dir.trim().to_string();
@@ -426,7 +470,7 @@ fn opkg_install(project_dir: String, package: String) -> Result<ExecResult, Stri
     return Err("package is required".to_string());
   }
 
-  let mut opkg = Command::new("opkg");
+  let mut opkg = cross_platform_command("opkg");
   opkg
     .arg("install")
     .arg(&package)
@@ -439,7 +483,7 @@ fn opkg_install(project_dir: String, package: String) -> Result<ExecResult, Stri
     return Ok(result);
   }
 
-  let mut openpackage = Command::new("openpackage");
+  let mut openpackage = cross_platform_command("openpackage");
   openpackage
     .arg("install")
     .arg(&package)
@@ -452,7 +496,7 @@ fn opkg_install(project_dir: String, package: String) -> Result<ExecResult, Stri
     return Ok(result);
   }
 
-  let mut pnpm = Command::new("pnpm");
+  let mut pnpm = cross_platform_command("pnpm");
   pnpm
     .arg("dlx")
     .arg("opkg")
@@ -467,7 +511,7 @@ fn opkg_install(project_dir: String, package: String) -> Result<ExecResult, Stri
     return Ok(result);
   }
 
-  let mut npx = Command::new("npx");
+  let mut npx = cross_platform_command("npx");
   npx
     .arg("opkg")
     .arg("install")
