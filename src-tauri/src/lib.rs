@@ -2,7 +2,7 @@ use std::{
   env,
   ffi::OsStr,
   fs,
-  net::TcpListener,
+  net::{TcpListener, TcpStream},
   path::{Path, PathBuf},
   process::{Child, Command, Stdio},
   sync::Mutex,
@@ -68,6 +68,10 @@ fn find_free_port() -> Result<u16, String> {
   let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
   let port = listener.local_addr().map_err(|e| e.to_string())?.port();
   Ok(port)
+}
+
+fn check_external_server(port: u16) -> bool {
+  TcpStream::connect(("127.0.0.1", port)).is_ok()
 }
 
 #[cfg(windows)]
@@ -305,7 +309,16 @@ impl EngineManager {
 #[tauri::command]
 fn engine_info(manager: State<EngineManager>) -> EngineInfo {
   let mut state = manager.inner.lock().expect("engine mutex poisoned");
-  EngineManager::snapshot_locked(&mut state)
+  let mut info = EngineManager::snapshot_locked(&mut state);
+
+  if !info.running && check_external_server(4096) {
+    info.running = true;
+    info.base_url = Some("http://127.0.0.1:4096".to_string());
+    info.port = Some(4096);
+    info.hostname = Some("127.0.0.1".to_string());
+  }
+
+  info
 }
 
 #[tauri::command]
@@ -317,7 +330,19 @@ fn engine_stop(manager: State<EngineManager>) -> EngineInfo {
 
 #[tauri::command]
 fn engine_doctor() -> EngineDoctorResult {
-  let (resolved, in_path, notes) = resolve_opencode_executable();
+  let (resolved, in_path, mut notes) = resolve_opencode_executable();
+
+  if resolved.is_none() && check_external_server(4096) {
+    notes.push("Executable not found, but server detected on port 4096.".to_string());
+    return EngineDoctorResult {
+      found: true,
+      in_path: false,
+      resolved_path: None,
+      version: Some("Running (External)".to_string()),
+      supports_serve: true,
+      notes,
+    };
+  }
 
   let (version, supports_serve) = match resolved.as_ref() {
     Some(path) => (
@@ -399,6 +424,17 @@ fn engine_start(manager: State<EngineManager>, project_dir: String) -> Result<En
   EngineManager::stop_locked(&mut state);
 
   let (program, _in_path, notes) = resolve_opencode_executable();
+  
+  // Fallback: If not found but running on 4096, use it.
+  if program.is_none() && check_external_server(4096) {
+    state.child = None;
+    state.project_dir = Some(project_dir);
+    state.hostname = Some(hostname);
+    state.port = Some(4096);
+    state.base_url = Some("http://127.0.0.1:4096".to_string());
+    return Ok(EngineManager::snapshot_locked(&mut state));
+  }
+  
   let Some(program) = program else {
     let notes_text = notes.join("\n");
     #[cfg(windows)]

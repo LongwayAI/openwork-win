@@ -57,7 +57,7 @@ OpenWork is designed to be:
 ### Requirements
 
 - Node.js + `pnpm`
-- Rust toolchain (for Tauri): `cargo`, `rustc`
+- Rust toolchain (for Tauri): `cargo`, `rustc` ([Windows installation guide](./INSTALL_RUST_WINDOWS.md))
 - OpenCode CLI installed and available on PATH: `opencode`
 
 ### Install
